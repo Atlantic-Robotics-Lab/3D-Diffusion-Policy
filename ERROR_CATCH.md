@@ -143,3 +143,23 @@ This is because no specific opencv-python version, go to 3D-Diffusion-Policy/thi
 - Error: python -m train ... Fails with PathNotFoundError Due to Incorrect Current Working Directory.
 
 Check this [issue](https://github.com/YanjieZe/3D-Diffusion-Policy/issues/152) for a fix.
+
+
+
+
+PYTORCH BUILD ERRORS
+
+RuntimeError: Error compiling objects for extension
+[end of output]
+
+note: This error originates from a subprocess, and is likely not a problem with pip.
+ERROR: Failed building wheel for pytorch3d
+Running setup.py clean for pytorch3d
+Failed to build pytorch3d
+ERROR: ERROR: Failed to build installable wheels for some pyproject.toml based projects (pytorch3d)
+
+--
+pip uninstall -y torch torchvision torchaudio pytorch3d
+pip install torch==1.13.1+cu117 torchvision==0.14.1+cu117 torchaudio==0.13.1 --extra-index-url https://download.pytorch.org/whl/cu117
+pip install pytorch3d==0.7.6 -f https://dl.fbaipublicfiles.com/pytorch3d/packaging/wheels/py38_cu117_pyt1131/download.html
+

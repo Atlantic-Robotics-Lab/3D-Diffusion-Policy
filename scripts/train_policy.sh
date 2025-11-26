@@ -39,7 +39,8 @@ cd 3D-Diffusion-Policy
 
 export HYDRA_FULL_ERROR=1 
 export CUDA_VISIBLE_DEVICES=${gpu_id}
-python train.py --config-name=${config_name}.yaml \
+export DEBUGPY_PORT=5678
+python -m debugpy --listen 0.0.0.0:${DEBUGPY_PORT} --wait-for-client train.py --config-name=${config_name}.yaml \
                             task=${task_name} \
                             hydra.run.dir=${run_dir} \
                             training.debug=$DEBUG \

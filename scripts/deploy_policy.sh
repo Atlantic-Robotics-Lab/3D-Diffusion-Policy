@@ -1,28 +1,37 @@
-# use the same command as training except the script
-# for example:
-# bash scripts/eval_policy.sh dp3 adroit_hammer 0322 0 0
+# Examples:
 
+#   bash scripts/deploy_policy.sh idp3 gr1_dex-3d 0913_example
+#   bash scripts/deploy_policy.sh dp_224x224_r3m gr1_dex-image 0913_example
+
+dataset_path=/home/atu-2/3D-Diffusion-Policy/3D-Diffusion-Policy/data/P_P
 
 
 DEBUG=False
+save_ckpt=True
 
 alg_name=${1}
 task_name=${2}
 config_name=${alg_name}
 addition_info=${3}
-seed=${4}
+seed=0
 exp_name=${task_name}-${alg_name}-${addition_info}
 run_dir="data/outputs/${exp_name}_seed${seed}"
 
-gpu_id=${5}
+gpu_id=0
+echo -e "\033[33mgpu id (to use): ${gpu_id}\033[0m"
 
 
 cd 3D-Diffusion-Policy
+if [ $DEBUG = True ]; then
+    wandb_mode=offline
+else
+    wandb_mode=online
+fi
 
-export HYDRA_FULL_ERROR=1
+export HYDRA_FULL_ERROR=1 
 export CUDA_VISIBLE_DEVICES=${gpu_id}
-
-# python eval.py --config-name=${config_name}.yaml \
+export OC_CAUSE=1
+# python deploy.py --config-name=${config_name}.yaml \
 export DEBUGPY_PORT=5678
 python -m debugpy --listen 0.0.0.0:${DEBUGPY_PORT} --wait-for-client eval.py --config-name=${config_name}.yaml \
                             task=${task_name} \
@@ -32,7 +41,8 @@ python -m debugpy --listen 0.0.0.0:${DEBUGPY_PORT} --wait-for-client eval.py --c
                             training.device="cuda:0" \
                             exp_name=${exp_name} \
                             logging.mode=${wandb_mode} \
-                            checkpoint.save_ckpt=${save_ckpt}
+                            checkpoint.save_ckpt=${save_ckpt} \
+                            task.dataset.zarr_path=$dataset_path 
 
 
 

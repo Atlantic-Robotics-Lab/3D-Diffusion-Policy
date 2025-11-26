@@ -1,5 +1,6 @@
 defaults:
-  - task: adroit_hammer
+  - _self_
+  - task: pickandplace
 
 name: train_simple_dp3
 
@@ -10,9 +11,9 @@ exp_name: "debug"
 
 # horizon: 4
 horizon: 16
-n_obs_steps: 2
+n_obs_steps: 1
 # n_action_steps: 3
-n_action_steps: 8
+n_action_steps: 1
 n_latency_steps: 0
 dataset_obs_steps: ${n_obs_steps}
 keypoint_visible_rate: 1.0
@@ -60,13 +61,13 @@ policy:
 
 
   # whether to use point cloud's color
-  use_pc_color: false
+  use_pc_color: true
   # type of pointnet
   pointnet_type: "pointnet"
 
 
   pointcloud_encoder_cfg:
-    in_channels: 3
+    in_channels: 6  # 3 for xyz, 3 for rgb
     out_channels: ${policy.encoder_output_dim}
     use_layernorm: true
     final_norm: layernorm # layernorm, none
@@ -109,7 +110,7 @@ training:
   resume: True
   lr_scheduler: cosine
   lr_warmup_steps: 500
-  num_epochs: 3000
+  num_epochs: 1000
   gradient_accumulate_every: 1
   use_ema: True
   rollout_every: 200

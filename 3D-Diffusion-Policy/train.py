@@ -31,7 +31,8 @@ from diffusion_policy_3d.common.checkpoint_util import TopKCheckpointManager
 from diffusion_policy_3d.common.pytorch_util import dict_apply, optimizer_to
 from diffusion_policy_3d.model.diffusion.ema_model import EMAModel
 from diffusion_policy_3d.model.common.lr_scheduler import get_scheduler
-
+from deploy import URDexEnvInference  # Adjust import path as needed
+from diffusion_policy_3d.env_runner.pickplace_runner import PickPlaceRunner
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
 class TrainDP3Workspace:
@@ -134,6 +135,7 @@ class TrainDP3Workspace:
 
         # configure env
         env_runner: BaseRunner
+        # env_runner = PickPlaceRunner(output_dir=self.output_dir)
         env_runner = hydra.utils.instantiate(
             cfg.task.env_runner,
             output_dir=self.output_dir)
@@ -333,6 +335,93 @@ class TrainDP3Workspace:
             self.epoch += 1
             del step_log
 
+
+    def eval_ur(self):
+        # ...existing code...
+        # load the latest checkpoint
+        cfg = copy.deepcopy(self.cfg)
+        lastest_ckpt_path = self.get_checkpoint_path(tag="latest")
+        if lastest_ckpt_path.is_file():
+            cprint(f"Resuming from checkpoint {lastest_ckpt_path}", 'magenta')
+            self.load_checkpoint(path=lastest_ckpt_path)
+
+        # Use policy definition to set variables
+        policy = self.model
+        if cfg.training.use_ema:
+            policy = self.ema_model
+        policy.eval()
+        policy.cuda()
+
+        # Get deployment parameters from policy or config
+        action_horizon = getattr(policy, 'horizon', 16) - getattr(policy, 'n_obs_steps', 1) + 1
+        use_image = getattr(policy, 'use_image', True)
+        use_point_cloud = getattr(policy, 'use_point_cloud', True)
+        img_size = getattr(policy, 'img_size', 84)
+        num_points = getattr(policy, 'num_points', 1024)
+        roll_out_length = getattr(policy, 'roll_out_length', 100)
+        ur_ip = getattr(policy, 'ur_ip', "192.168.1.102")
+        obs_horizon = getattr(policy, 'obs_horizon', 1)
+        device = getattr(policy, 'device', "cpu")
+
+        env = URDexEnvInference(
+            ur_ip=ur_ip,
+            obs_horizon=obs_horizon,
+            action_horizon=action_horizon,
+            device=device,
+            use_point_cloud=use_point_cloud,
+            use_image=use_image,
+            img_size=img_size,
+            num_points=num_points
+        )
+        obs = env.reset(first_init=True)
+        policy.reset()
+        step_count = 0
+        while step_count < roll_out_length:
+            np_obs_dict = dict(obs)
+            obs_dict = dict_apply(np_obs_dict,lambda x: torch.from_numpy(x).to(device=device))
+            
+            with torch.no_grad():
+                # action = policy(obs_dict)[0]
+                # action_list = [act.cpu().numpy() for act in action]
+                obs_dict_input = {}  # flush unused keys
+                obs_dict_input['point_cloud'] = obs_dict['point_cloud'].unsqueeze(0)
+                obs_dict_input['agent_pos'] = obs_dict['agent_pos'].unsqueeze(0)
+                action_dict = policy.predict_action(obs_dict_input)
+            np_action_dict = dict_apply(action_dict,
+                                        lambda x: x.detach().to('cpu').numpy())
+
+            action_list = np_action_dict['action'].squeeze(0)
+            obs_dict = env.step(action_list)
+            step_count += action_horizon
+            print(f"step: {step_count}")
+
+        # Optionally, save data as in deploy.py
+        record_data = True
+        if record_data:
+            import h5py
+            root_dir = "./ur_deploy_data/"
+            save_dir = root_dir + "deploy_dir"
+            os.makedirs(save_dir, exist_ok=True)
+            record_file_name = f"{save_dir}/demo.h5"
+            color_array = np.array(env.color_array)
+            depth_array = np.array(env.depth_array)
+            cloud_array = np.array(env.cloud_array)
+            qpos_array = np.array(env.env_qpos_array)
+            with h5py.File(record_file_name, "w") as f:
+                f.create_dataset("color", data=np.array(color_array))
+                f.create_dataset("depth", data=np.array(depth_array))
+                f.create_dataset("cloud", data=np.array(cloud_array))
+                f.create_dataset("qpos", data=np.array(qpos_array))
+            choice = input("whether to rename: y/n")
+            if choice == "y":
+                renamed = input("file rename:")
+                os.rename(src=record_file_name, dst=record_file_name.replace("demo.h5", renamed+'.h5'))
+                new_name = record_file_name.replace("demo.h5", renamed+'.h5')
+                print(f"save data at step: {roll_out_length} in {new_name}")
+            else:
+                print(f"save data at step: {roll_out_length} in {record_file_name}")
+
+# ...existing code...
     def eval(self):
         # load the latest checkpoint
         

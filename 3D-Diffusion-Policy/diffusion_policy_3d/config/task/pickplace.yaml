@@ -1,0 +1,39 @@
+name: pickplace
+
+task_name: pickandplace
+
+shape_meta: &shape_meta
+  # acceptable types: rgb, low_dim
+  obs:
+    point_cloud:
+      shape: [1024, 6]
+      type: point_cloud
+    agent_pos:
+      shape: [7]
+      type: low_dim
+  action:
+    shape: [7]
+
+env_runner: null
+
+# env_runner:
+#   _target_: diffusion_policy_3d.env_runner.pickplace_runner.PickPlaceRunner
+#   # Add any required arguments here, e.g.:
+#   ur_ip: "192.168.1.102"
+#   n_obs_steps: ${n_obs_steps}
+#   n_action_steps: ${n_action_steps}
+#   device: ${training.device}
+#   use_point_cloud: true
+#   # use_image: false
+#   # img_size: 224
+#   # num_points: 4096
+
+dataset:
+  _target_: diffusion_policy_3d.dataset.pickplace_dataset.PickPlaceDataset
+  zarr_path: data/P_P_latest.zarr
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.02
+  max_train_episodes: 90
