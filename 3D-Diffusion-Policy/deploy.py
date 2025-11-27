@@ -11,7 +11,8 @@ from omegaconf import OmegaConf
 import pathlib
 import numpy as np
 from scipy.spatial.transform import Rotation as R
-
+from diffusion_policy_3d.env.ur5_bullet.UR5.UR5Sim import UR5Sim
+from plotter import JointPlotter, ActionPlot, ActionPosePlot
 
 
 # Dummy policy import (replace with actual policy loading)
@@ -58,13 +59,31 @@ class URDexEnvInference:
         #     print("Stopped RealSense pipeline.")
     
         # UR RTDE setup
-        self.rtde_c = RTDEControlInterface(ur_ip)
-        self.rtde_r = RTDEReceiveInterface(ur_ip)
+        self.plot = False
+        self.simulation = False  # Set to True to use simulation
+        self.once = False
+        self.current_tcp_pose = None
+        if(self.simulation):
+            self.sim = UR5Sim()
+            self.sim.add_gui_sliders()
+        else:
+            self.rtde_c = RTDEControlInterface(ur_ip)
+            self.rtde_r = RTDEReceiveInterface(ur_ip)
+            # home = [-1.57, -1.57, 1.57, -1.57, -1.57, 3.14] #0, -1.57, 1.57, 0, 1.57, 0 base, shoulder, elbow, wrist1, wrist2, wrist3
+            # self.rtde_c.moveJ(home, speed=0.2, acceleration=0.2)
 
         # Buffers
         self.color_array, self.depth_array, self.cloud_array = [], [], []
         self.env_qpos_array = []
         self.action_array = []
+        
+        if self.plot:
+            # self.joint_plotter = JointPlotter(num_joints=6)
+            # self.action_plot = ActionPlot(num_actions=7, labels=['dx','dy','dz','qx','qy','qz','qw'])
+            self.pose_plotter = ActionPosePlot(action_dim=6, labels=['dx','dy','dz','drx','dry','drz'], plot_tcp=True)
+
+
+
 
     def get_realsense_obs(self, with_rgb=True):
         frames = self.pipeline.wait_for_frames()
@@ -119,7 +138,10 @@ class URDexEnvInference:
         Output: np.array([x, y, z, qx, qy, qz, qw])
         """
         # Get TCP pose: [x, y, z, rx, ry, rz]  (rotation vector)
-        tcp_pose = np.array(self.rtde_r.getActualTCPPose())
+        if(self.simulation):
+            tcp_pose = np.array(self.sim.get_current_pose())
+        else:
+            tcp_pose = np.array(self.rtde_r.getActualTCPPose())
         
         # Extract position (meters)
         position = tcp_pose[:3]
@@ -134,19 +156,274 @@ class URDexEnvInference:
         
         return ee_pose_quat
 
+    def run_robot(self, pose):
+        """
+        Move the robot to the given pose (position + quaternion).
+        Args:
+            pose: np.array([x, y, z, qx, qy, qz, qw])
+        """
+        pos = pose[:3]
+        quat = pose[3:]
+        # Convert quaternion to rotation vector
+        rotvec = R.from_quat(quat).as_rotvec()
+        tcp_target = np.concatenate([pos, rotvec])
+        # Compute joint angles using inverse kinematics
+
+        if not self.simulation:
+            q = self.rtde_c.getInverseKinematics(tcp_target)
+            if q:
+                self.rtde_c.moveJ(q, speed=0.2, acceleration=0.2)
+                joints = self.rtde_r.getActualQ()
+                print(joints)
+            else:
+                print("Real robot IK failed for target:", tcp_target)
+                
+        else:
+            current_tcp = self.sim.get_current_pose()   # 6 numbers: pos+rotvec
+            print("Current TCP pose:", current_tcp, " for target:", tcp_target)
+            real_joints = [-2.2194951216327112, -1.9163762531676234, 1.8138564268695276, -1.3718397480300446, -1.4639533201800745, -0.6300724188434046]
+            while True:
+                q = self.sim.calculate_ik_real([tcp_target[0], tcp_target[1], tcp_target[2]], [tcp_target[3], tcp_target[4], tcp_target[5]], restposes=real_joints)
+                 #self.rtde_c.moveJ(act, speed=0.5, acceleration=0.5)
+                print("Sending joint target:", q)
+                if q:
+                    self.sim.set_joint_angles(q) #, speed=0.2, acceleration=0.2)
+                    current_joint_angles = self.sim.get_joint_angles()
+                    current_tcp = self.sim.get_current_pose()   # 6 numbers: pos+rotvec
+                    max_error = max(abs(c - t) for c, t in zip(current_joint_angles, q))
+                    if max_error < 0.01 and np.linalg.norm(current_tcp - tcp_target) < 0.01:
+                        self.sim.set_joint_angles_update(real_joints)
+                        break
+                    # current_tcp = self.sim.get_current_pose()   # 6 numbers: pos+rotvec
+                    # if np.linalg.norm(current_tcp - tcp_target) < 0.01:
+                    #     break
+                    print("Joint angles ", current_joint_angles)
+                    print("Current TCP pose:", current_tcp, " after moving to target ", tcp_target)
+                else:
+                    print("Inverse kinematics failed for target:", tcp_target)
+        
+
     def step(self, action_list):
-        for action_id in range(self.action_horizon):
+        if(self.simulation):
+            return self.step_sim(action_list)
+        else:
+            return self.step_real(action_list)
+
+    def step_real(self, action_list):
+        
+        # current_tcp = self.rtde_r.getActualTCPPose()   # 6 numbers: pos+rotvec
+        # print("Current TCP pose:", current_tcp)
+        # current_pos = np.zeros(3) #np.array(current_tcp[:3])
+        # current_rotvec = np.array([0,0,0]) #np.array(current_tcp[3:])
+    
+        for action_id in range(self.action_horizon): #len(action_list) >= self.action_horizon
+            act = action_list[action_id]
+            self.action_array.append(act)
+            
+            # self.action_plot.update(act)
+        
+            
+            # Send action to UR robot#
+            np.set_printoptions(precision=6, suppress=True)
+            current_tcp = self.rtde_r.getActualTCPPose()   # 6 numbers: pos+rotvec
+            print("Current TCP pose:", current_tcp)
+            current_pos = np.array(current_tcp[:3])
+            current_rotvec = np.array(current_tcp[3:])
+            # print("Sending home")
+            # home = [0, -1.57, 1.57, 0, 1.57, 0]
+            # result = self.rtde_c.moveJ(home, speed=0.2, acceleration=0.2)
+            print("Sending cartesian target:", act)
+            # print("moveJ result:", result)
+
+            if self.plot:
+                scale_factor = 1  # Scale factor for position changes
+                if not self.once:
+                    self.current_tcp_pose = current_tcp[:3]
+                    self.once = True
+                        
+                new_tcp = self.current_tcp_pose + act[:3]*scale_factor
+                self.pose_plotter.update(act[:6], new_tcp)
+                self.current_tcp_pose = new_tcp
+            # pos = act[:3]
+            # quat = act[3:]
+            # rot = R.from_quat(quat)
+            # rotvec = rot.as_rotvec()
+            # tcp_target = np.concatenate([pos, rotvec])
+            # print("TCP target:", tcp_target)
+            # result = self.rtde_c.moveL(tcp_target, speed=0.5, acceleration=0.5)
+            # quat = quat / np.linalg.norm(quat)
+
+            # tcp_target = np.concatenate([pos, quat])
+            # time.sleep(0.1)
+
+            
+            # print("Sending tcp target:", tcp_target)
+            
+
+
+            current_quat = R.from_rotvec(current_rotvec).as_quat()
+            delta_pos = act[:3] #np.zeros(3) #act[:3]
+            delta_quat =  act[3] #np.array([0, 0, 0, 1]) #act[3:]
+            
+            test_quat = act[3:6] #Rest is junk
+            delta_rot = R.from_rotvec(test_quat).as_quat()
+            print("Delta rotvec:", test_quat, " as quat:", delta_rot)
+            delta_quat = delta_rot
+            
+            # current_quat = current_quat + delta_quat
+            
+            
+            # normalize policy quaternion
+            # if np.linalg.norm(delta_quat) < 1e-6:
+            #     delta_quat = np.array([0, 0, 0, 1]) 
+            # else:
+            # delta_quat = delta_quat / np.linalg.norm(delta_quat)
+            # delta_quat = np.array([delta_quat[1], delta_quat[2], delta_quat[3], delta_quat[0]]) #Not needed
+            # compose quaternions: q_new = q_current ⊗ q_delta
+
+            #TEST =============
+            delta_quat = delta_quat / np.linalg.norm(delta_quat)
+            new_quat = R.from_quat(current_quat) * R.from_quat(delta_quat)
+            new_quat = new_quat.as_quat()
+            print("Test quat sum:", current_quat, " new quat:", new_quat)
+            #==================
+
+            new_pos = current_pos + delta_pos
+            new_rotvec = R.from_quat(new_quat).as_rotvec() #current_rotvec #
+            tcp_target = np.concatenate([new_pos, new_rotvec])
+            # tcp_target[3:] = tcp_target[3:] / np.linalg.norm(tcp_target[3:]) #No need
+            print("Sending new tcp target:", tcp_target)
+
+            # self.rtde_c.moveL(tcp_target, speed=0.2, acceleration=0.2)
+
+            #xyzrxryrz
+            q = self.rtde_c.getInverseKinematics(tcp_target)
+            #self.rtde_c.moveJ(act, speed=0.5, acceleration=0.5)
+            print("Sending joint target:", q)
+            if q and not self.plot:
+                # print("Sending joint target:", q)
+                self.rtde_c.moveJ(q, speed=0.2, acceleration=0.2)
+                # self.joint_plotter.update(q)
+            else:
+                print("Inverse kinematics failed for target or plotting :", tcp_target)
+                
+            # result = self.rtde_c.moveJ(q, speed=0.5, acceleration=0.5)
+            color, depth, cloud = self.get_realsense_obs()
+            self.cloud_array.append(cloud)
+            self.color_array.append(color)
+            self.depth_array.append(depth)
+            agent_pos = self.get_agent_pos()
+            if self.plot:
+                agent_pose = np.concatenate([self.current_tcp_pose,new_quat])
+            self.env_qpos_array.append(agent_pos)
+        # Build obs_dict
+        agent_pos = np.stack(self.env_qpos_array[-self.obs_horizon:], axis=0)
+        obs_cloud = np.stack(self.cloud_array[-self.obs_horizon:], axis=0)
+        obs_img = np.stack(self.color_array[-self.obs_horizon:], axis=0)
+        obs_dict = {
+            'agent_pos': agent_pos, #torch.from_numpy(agent_pos).unsqueeze(0).to(self.device),
+        }
+        if self.use_point_cloud:
+            obs_dict['point_cloud'] = obs_cloud #torch.from_numpy(obs_cloud).unsqueeze(0).to(self.device)
+        if self.use_image:
+            obs_dict['image'] = obs_img #torch.from_numpy(obs_img).permute(0, 3, 1, 2).unsqueeze(0)
+        # reward = 0.0
+        # done = False
+        # info = {}
+        return obs_dict #, reward, done, info
+    
+    def step_sim(self, action_list):
+        np.set_printoptions(precision=6, suppress=True)
+        # current_tcp = self.sim.get_current_pose()   # 6 numbers: pos+rotvec
+        # print("Current TCP pose:", current_tcp)
+        # current_pos = np.zeros(3) #np.array(current_tcp[:3])
+        # current_rotvec = np.array([0,0,0]) #np.array(current_tcp[3:])
+    
+        for action_id in range(self.action_horizon): #len(action_list) >= self.action_horizon
             act = action_list[action_id]
             self.action_array.append(act)
             # Send action to UR robot#
-            print("Sending home")
-            home = [0, -1.57, 1.57, 0, 1.57, 0]
-            self.rtde_c.moveJ(home, speed=0.5, acceleration=0.5)
-            print("Sending joint target:", act)
+            np.set_printoptions(precision=6, suppress=True)
+            current_tcp = self.sim.get_current_pose()   # 6 numbers: pos+rotvec
+            print("Current TCP pose:", current_tcp)
+            current_pos = np.array(current_tcp[:3])
+            current_rotvec = np.array(current_tcp[3:])
+            # print("Sending home")
+            # home = [0, -1.57, 1.57, 0, 1.57, 0]
+            # result = self.rtde_c.moveJ(home, speed=0.2, acceleration=0.2)
+            print("Sending cartesian target:", act)
+            # print("moveJ result:", result)
+
+            # pos = act[:3]
+            # quat = act[3:]
+            # rot = R.from_quat(quat)
+            # rotvec = rot.as_rotvec()
+            # tcp_target = np.concatenate([pos, rotvec])
+            # print("TCP target:", tcp_target)
+            # result = self.rtde_c.moveL(tcp_target, speed=0.5, acceleration=0.5)
+            # quat = quat / np.linalg.norm(quat)
+
+            # tcp_target = np.concatenate([pos, quat])
+            # time.sleep(0.1)
+
             
-            #self.rtde_c.moveJ(act, speed=0.5, acceleration=0.5)
-            result = self.rtde_c.moveJ(act, speed=0.5, acceleration=0.5)
-            print("moveJ result:", result)
+            # print("Sending tcp target:", tcp_target)
+            
+
+
+            current_quat = R.from_rotvec(current_rotvec).as_quat()
+            delta_pos = act[:3] #np.zeros(3) #act[:3]
+            delta_quat =  act[3:] #np.array([0, 0, 0, 1]) #act[3:]
+
+            test_quat = act[3:6] #Rest is junk
+            delta_rot = R.from_rotvec(test_quat).as_quat()
+            print("Delta rotvec:", test_quat, " as quat:", delta_rot)
+            delta_quat = delta_rot
+            delta_quat = delta_quat / np.linalg.norm(delta_quat)
+
+            # normalize policy quaternion
+            # delta_quat = delta_quat / np.linalg.norm(delta_quat)
+            # delta_quat = np.array([delta_quat[1], delta_quat[2], delta_quat[3], delta_quat[0]]) #Not needed
+            # compose quaternions: q_new = q_current ⊗ q_delta
+            new_quat = R.from_quat(current_quat)* R.from_quat(delta_quat)
+            new_quat = new_quat.as_quat()
+
+            new_pos = current_pos + delta_pos
+            new_rotvec = R.from_quat(new_quat).as_rotvec() #current_rotvec #
+            tcp_target = np.concatenate([new_pos, new_rotvec])
+            # tcp_target[3:] = tcp_target[3:] / np.linalg.norm(tcp_target[3:]) #No need
+            print("Sending new tcp target:", tcp_target)
+
+            # self.rtde_c.moveL(tcp_target, speed=0.2, acceleration=0.2)
+            
+            #xyzrxryrz
+            # q = self.sim.calculate_ik([tcp_target[0], tcp_target[1], tcp_target[2]], [tcp_target[3], tcp_target[4], tcp_target[5]])
+            # #self.rtde_c.moveJ(act, speed=0.5, acceleration=0.5)
+            # print("Sending joint target:", q)
+            # if q:
+            #     self.sim.set_joint_angles(q) #, speed=0.2, acceleration=0.2)
+            # else:
+            #     print("Inverse kinematics failed for target:", tcp_target)
+                
+            #Real joints from first pose
+            real_joints = [-2.2194951216327112, -1.9163762531676234, 1.8138564268695276, -1.3718397480300446, -1.4639533201800745, -0.6300724188434046]
+            while True:
+                q = self.sim.calculate_ik_real([tcp_target[0], tcp_target[1], tcp_target[2]], [tcp_target[3], tcp_target[4], tcp_target[5]], restposes=real_joints)
+                 #self.rtde_c.moveJ(act, speed=0.5, acceleration=0.5)
+                print("Sending joint target:", q)
+                if q:
+                    self.sim.set_joint_angles(q) #, speed=0.2, acceleration=0.2)
+                    current_joint_angles = self.sim.get_joint_angles()
+                    current_tcp = self.sim.get_current_pose()   # 6 numbers: pos+rotvec
+                    max_error = max(abs(c - t) for c, t in zip(current_joint_angles, q))
+                    if max_error < 0.01 and np.linalg.norm(current_tcp - tcp_target) < 0.01:
+                        break
+                    print("Current TCP pose:", current_tcp, " after moving to target.")
+                else:
+                    print("Inverse kinematics failed for target:", tcp_target)
+                    
+                
+            # result = self.rtde_c.moveJ(q, speed=0.5, acceleration=0.5)
             color, depth, cloud = self.get_realsense_obs()
             self.cloud_array.append(cloud)
             self.color_array.append(color)
@@ -158,13 +435,16 @@ class URDexEnvInference:
         obs_cloud = np.stack(self.cloud_array[-self.obs_horizon:], axis=0)
         obs_img = np.stack(self.color_array[-self.obs_horizon:], axis=0)
         obs_dict = {
-            'agent_pos': torch.from_numpy(agent_pos).unsqueeze(0).to(self.device),
+            'agent_pos': agent_pos, #torch.from_numpy(agent_pos).unsqueeze(0).to(self.device),
         }
         if self.use_point_cloud:
-            obs_dict['point_cloud'] = torch.from_numpy(obs_cloud).unsqueeze(0).to(self.device)
+            obs_dict['point_cloud'] = obs_cloud #torch.from_numpy(obs_cloud).unsqueeze(0).to(self.device)
         if self.use_image:
-            obs_dict['image'] = torch.from_numpy(obs_img).permute(0, 3, 1, 2).unsqueeze(0)
-        return obs_dict
+            obs_dict['image'] = obs_img #torch.from_numpy(obs_img).permute(0, 3, 1, 2).unsqueeze(0)
+        # reward = 0.0
+        # done = False
+        # info = {}
+        return obs_dict #, reward, done, info
 
     def reset(self, first_init=True):
         self.color_array, self.depth_array, self.cloud_array = [], [], []

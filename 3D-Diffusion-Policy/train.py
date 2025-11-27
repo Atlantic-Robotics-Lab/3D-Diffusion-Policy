@@ -23,6 +23,9 @@ from termcolor import cprint
 import shutil
 import time
 import threading
+import zarr
+import open3d as o3d
+
 from hydra.core.hydra_config import HydraConfig
 from diffusion_policy_3d.policy.dp3 import DP3
 from diffusion_policy_3d.dataset.base_dataset import BaseDataset
@@ -68,6 +71,10 @@ class TrainDP3Workspace:
         # configure training state
         self.global_step = 0
         self.epoch = 0
+	#TODO Parameterize
+        self.eval_episodes = 20
+        self.tqdm_interval_sec = 5.0
+        self.max_steps = 200
 
     def run(self):
         cfg = copy.deepcopy(self.cfg)
@@ -335,6 +342,35 @@ class TrainDP3Workspace:
             self.epoch += 1
             del step_log
 
+# ==== VISUALIZE POINT CLOUD ====
+    def visualize_point_cloud(self,pc):
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(pc)
+        o3d.visualization.draw_geometries([pcd])
+
+    # ==== VISUALIZE PC + EEF ====
+    def visualize_pc_and_eef(self,pc, eef_pos):
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(pc)
+
+        eef_sphere = o3d.geometry.TriangleMesh.create_sphere(radius=0.01)
+        eef_sphere.translate(eef_pos)
+        eef_sphere.paint_uniform_color([1, 0, 0])  # red sphere for eef
+
+        o3d.visualization.draw_geometries([pcd, eef_sphere])
+    
+    def visualize(self,obs_dict_input):
+        pc_raw = obs_dict_input['point_cloud'][0,0].cpu().numpy()   # [1024,6]
+        pc_vis = pc_raw[:, :3]   # shape [1024,3]
+        eef_vis = obs_dict_input['agent_pos'][0,0,:3].cpu().numpy()  # xyz only
+
+        print("---- Debug Observation ----")
+        print("PC shape:", pc_vis.shape)
+        print("EEF pose:", obs_dict_input['agent_pos'][0,0].cpu().numpy())
+        print("PC sample:", pc_vis[:5])
+
+        # View point cloud
+        self.visualize_pc_and_eef(pc_vis, eef_vis)
 
     def eval_ur(self):
         # ...existing code...
@@ -351,9 +387,9 @@ class TrainDP3Workspace:
             policy = self.ema_model
         policy.eval()
         policy.cuda()
-
+        print("Dataset path:", cfg.task.dataset.zarr_path)    
         # Get deployment parameters from policy or config
-        action_horizon = getattr(policy, 'horizon', 16) - getattr(policy, 'n_obs_steps', 1) + 1
+        action_horizon = getattr(policy, 'n_action_steps', 1) - getattr(policy, 'n_obs_steps', 1) + 1 #horizon vs n_action_steps
         use_image = getattr(policy, 'use_image', True)
         use_point_cloud = getattr(policy, 'use_point_cloud', True)
         img_size = getattr(policy, 'img_size', 84)
@@ -362,7 +398,16 @@ class TrainDP3Workspace:
         ur_ip = getattr(policy, 'ur_ip', "192.168.1.102")
         obs_horizon = getattr(policy, 'obs_horizon', 1)
         device = getattr(policy, 'device', "cpu")
+        
+        # Using from ZARR 
+        zarr_path = getattr(cfg.task.dataset, 'zarr_path', 'test.zarr')
+        zarr_store = zarr.open(zarr_path, mode='r')
+        zarr_actions = zarr_store['data']['action'][:]
+        zarr_pc = zarr_store['data']['point_cloud'][:]
+        zarr_eef = zarr_store['data']['robot_eef_pose'][:]
+        roll_out_length = zarr_actions.shape[0]
 
+        
         env = URDexEnvInference(
             ur_ip=ur_ip,
             obs_horizon=obs_horizon,
@@ -373,30 +418,71 @@ class TrainDP3Workspace:
             img_size=img_size,
             num_points=num_points
         )
-        obs = env.reset(first_init=True)
-        policy.reset()
-        step_count = 0
-        while step_count < roll_out_length:
-            np_obs_dict = dict(obs)
-            obs_dict = dict_apply(np_obs_dict,lambda x: torch.from_numpy(x).to(device=device))
-            
-            with torch.no_grad():
-                # action = policy(obs_dict)[0]
-                # action_list = [act.cpu().numpy() for act in action]
-                obs_dict_input = {}  # flush unused keys
-                obs_dict_input['point_cloud'] = obs_dict['point_cloud'].unsqueeze(0)
-                obs_dict_input['agent_pos'] = obs_dict['agent_pos'].unsqueeze(0)
-                action_dict = policy.predict_action(obs_dict_input)
-            np_action_dict = dict_apply(action_dict,
-                                        lambda x: x.detach().to('cpu').numpy())
+        #Test with zarr length
+        #============
+        self.max_steps = roll_out_length
+        #============
+        #Start from zarr first pose
+        test_pose = [ 0.08912115,  0.35432466,  0.49456423,  0.997388  , -0.01237399, -0.07082344,  0.00693512]
+        env.run_robot(test_pose)
+        for episode_idx in tqdm.tqdm(range(self.eval_episodes), desc=f"Eval in UR Pointcloud Env",
+                                     leave=False, mininterval=self.tqdm_interval_sec):
 
-            action_list = np_action_dict['action'].squeeze(0)
-            obs_dict = env.step(action_list)
-            step_count += action_horizon
-            print(f"step: {step_count}")
+            obs = env.reset(first_init=True)
+            # Use point cloud from zarr file for the first step
+            #Overwrite point cloud and eef from zarr file
+            #============
+            # obs['point_cloud'] = zarr_pc
+            # obs['agent_pos'] = zarr_eef
+            #============
+            policy.reset()
+            done = False
+
+            step_count = 0
+            while not done and step_count < self.max_steps:
+                np_obs_dict = dict(obs)
+                obs_dict = dict_apply(np_obs_dict,lambda x: torch.from_numpy(x).to(device=device))
+                
+                #Overwrite point cloud and eef from zarr file
+                #============
+                # pc = zarr_pc[step_count]               # shape: [N_points, 3]
+                # pc = torch.from_numpy(pc).unsqueeze(0) # shape: [1, N_points, 3]
+                # obs_dict['point_cloud'] = pc.to(device)
+                
+                # eef = zarr_eef[step_count]               # shape: [N_points, 3]
+                # eef = torch.from_numpy(eef).unsqueeze(0) # shape: [1, N_points, 3]
+                # obs_dict['agent_pos'] = eef.to(device)
+                #============
+
+                with torch.no_grad():
+                    # action = policy(obs_dict)[0]
+                    # action_list = [act.cpu().numpy() for act in action]
+                    obs_dict_input = {}  # flush unused keys
+                    # pc_batch = zarr_pc[step_count : step_count + action_horizon]      # shape [horizon, num_points, 3]
+                    # eef_batch = zarr_eef[step_count : step_count + action_horizon] 
+                    # obs_dict_input['point_cloud'] = torch.from_numpy(pc_batch).unsqueeze(0)  # shape [1, horizon, num_points, 3]
+                    # obs_dict_input['agent_pos'] = torch.from_numpy(eef_batch).unsqueeze(0)
+                    
+                    obs_dict_input['point_cloud'] = obs_dict['point_cloud'].unsqueeze(0) #[step_count : step_count + action_horizon] #unsqueeze(0)
+                    obs_dict_input['agent_pos'] = obs_dict['agent_pos'].unsqueeze(0) #[step_count : step_count + action_horizon] #.unsqueeze(0)
+                    # self.visualize(obs_dict_input)
+                    action_dict = policy.predict_action(obs_dict_input)
+                np_action_dict = dict_apply(action_dict,
+                                            lambda x: x.detach().to('cpu').numpy())
+
+                print("Predicted action std ", np.std(np_action_dict['action_pred']))
+                action_list = np_action_dict['action'].squeeze(0)
+                # action_list = zarr_actions[step_count: step_count + action_horizon] #Test
+                np.set_printoptions(precision=6, suppress=True)
+                print(f"Step: {step_count}, Action sent: {action_list}")
+                obs = env.step(action_list)
+                print("Agent pos after step:", obs['agent_pos'])
+                done = step_count >= self.max_steps
+                step_count += action_horizon
+                print(f"Incremented step: {step_count}")
 
         # Optionally, save data as in deploy.py
-        record_data = True
+        record_data = False #Commnted cause idk why
         if record_data:
             import h5py
             root_dir = "./ur_deploy_data/"
